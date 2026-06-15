@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use proptest::{arbitrary::any, strategy::Strategy};
 
-use super::{filesystem::TestFilesystem, record::Record};
+use super::{
+    filesystem::{TestFilesystem, arb_fs_atomicity},
+    record::Record,
+};
 use crate::variants::disk_v2::{
     BufferReader, BufferWriter, DiskBufferConfig, DiskBufferConfigBuilder, ReaderError, WriterError,
 };
@@ -32,9 +35,9 @@ pub enum Progress {
     Blocked,
 }
 
-pub fn arb_buffer_config() -> impl Strategy<Value = DiskBufferConfig<TestFilesystem>> {
-    any::<(u16, u16, u16)>()
-        .prop_map(|(n1, n2, n3)| {
+pub fn arb_buffer_config() -> impl Strategy<Value = DiskBufferConfigBuilder<TestFilesystem>> {
+    (any::<(u16, u16, u16)>(), arb_fs_atomicity())
+        .prop_map(|((n1, n2, n3), atomicity)| {
             let max_buffer_size = u64::from(n1) * 64;
             let max_data_file_size = u64::from(n2) * 2;
             let max_record_size = n3.into();
@@ -52,12 +55,11 @@ pub fn arb_buffer_config() -> impl Strategy<Value = DiskBufferConfig<TestFilesys
                 // readers to make progress, and we're not testing anything about whether or not the
                 // ledger makes it to disk durably.
                 .flush_interval(Duration::from_secs(10))
-                .filesystem(TestFilesystem::default())
+                .filesystem(TestFilesystem::with_atomicity(atomicity))
         })
-        .prop_filter_map(
-            "maximum size limits were too high, or zero",
-            validate_buffer_config,
-        )
+        .prop_filter_map("maximum size limits were too high, or zero", |builder| {
+            validate_buffer_config(builder.clone()).map(|_| builder)
+        })
 }
 
 /// Validates the given buffer config builder and generates a resulting configuration.

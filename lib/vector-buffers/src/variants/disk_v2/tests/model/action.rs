@@ -19,6 +19,38 @@ pub enum Action {
     FlushWrites,
     ReadRecord,
     AcknowledgeRead,
+    Writeback(Writeback),
+    Crash,
+}
+
+/// A stream the operating system flushed to disk on its own, ahead of any explicit flush.
+/// This allows us to model OS non-determinism in durability.
+#[derive(Clone, Debug)]
+pub enum Writeback {
+    /// The ledger's memory-mapped pages reach disk, the same durable effect as an `msync`.
+    LedgerContents,
+    /// A data file's dirty tail reaches disk, with the given degree of completeness.
+    DataContents { file: u16, tail: TailPersistence },
+    /// A single file's directory entry, its creation or deletion, reaches disk.
+    DirEntry(DirTarget),
+}
+
+/// The file whose directory entry reaches disk.
+#[derive(Clone, Debug)]
+pub enum DirTarget {
+    Ledger,
+    DataFile(u16),
+}
+
+/// How completely a data file's dirty tail reached disk, modelling append atomicity.
+#[derive(Clone, Copy, Debug)]
+pub enum TailPersistence {
+    /// Every dirty unit landed intact.
+    AllDirty,
+    /// A trailing unit did not land; the file is truncated at a unit boundary.
+    TornAtBoundary,
+    /// The trailing unit's size landed but its contents are garbage.
+    GarbageBoundary,
 }
 
 prop_compose! {
@@ -34,11 +66,37 @@ fn arb_action() -> impl Strategy<Value = Action> {
         3 => Just(Action::FlushWrites),
         5 => Just(Action::ReadRecord),
         4 => Just(Action::AcknowledgeRead),
+        3 => arb_writeback().prop_map(Action::Writeback),
+        1 => Just(Action::Crash),
         5 => any::<(u32, u16, u8, u8)>().prop_map(|(id, base_size, size_offset, event_count)| {
             let size = u32::from(base_size) + u32::from(size_offset);
             let event_count = event_count % 7;
             Action::WriteRecord(Record::new(id, size, u32::from(event_count)))
         }),
+    ]
+}
+
+fn arb_tail_persistence() -> impl Strategy<Value = TailPersistence> {
+    prop_oneof![
+        Just(TailPersistence::AllDirty),
+        Just(TailPersistence::TornAtBoundary),
+        Just(TailPersistence::GarbageBoundary),
+    ]
+}
+
+fn arb_dir_target() -> impl Strategy<Value = DirTarget> {
+    prop_oneof![
+        Just(DirTarget::Ledger),
+        (0u16..5).prop_map(DirTarget::DataFile)
+    ]
+}
+
+fn arb_writeback() -> impl Strategy<Value = Writeback> {
+    prop_oneof![
+        Just(Writeback::LedgerContents),
+        (0u16..5, arb_tail_persistence())
+            .prop_map(|(file, tail)| Writeback::DataContents { file, tail }),
+        arb_dir_target().prop_map(Writeback::DirEntry),
     ]
 }
 
@@ -80,6 +138,15 @@ pub fn sanitize_raw_actions(actions: Vec<Action>) -> Vec<Action> {
                 Action::AcknowledgeRead
             }),
             Action::FlushWrites => Some(Action::FlushWrites),
+            // The OS flushing a stream is always a valid thing to happen.
+            Action::Writeback(w) => Some(Action::Writeback(w)),
+            // A crash can happen at any point and invalidates outstanding read/ack accounting,
+            // since the reader restarts from its last durable position after reopen.
+            Action::Crash => {
+                unread_event_count += unacked_events;
+                unacked_events = 0;
+                Some(Action::Crash)
+            }
         })
         .collect::<Vec<_>>()
 }

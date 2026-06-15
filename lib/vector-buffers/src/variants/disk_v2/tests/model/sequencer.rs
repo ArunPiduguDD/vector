@@ -235,6 +235,12 @@ impl ActionSequencer {
             Action::WriteRecord(_) | Action::FlushWrites => allow_write,
             Action::ReadRecord => allow_read,
             Action::AcknowledgeRead => !self.unacked_events.is_empty(),
+            // A writeback and a crash both act on the filesystem outside the
+            // reader/writer. They run only when neither has an operation in
+            // flight, keeping the model in lockstep.
+            Action::Writeback(_) | Action::Crash => {
+                allow_read && (allow_write || self.write_state.is_closed())
+            }
         })
     }
 
@@ -288,10 +294,21 @@ impl ActionSequencer {
                     drop(self.unacked_events.pop_front().expect("FIXME"));
                     Some(Action::AcknowledgeRead)
                 }
+                // Applied to the filesystem only, reader and writer are idle,
+                // no in-flight state to transition to.
+                a @ (Action::Writeback(_) | Action::Crash) => Some(a),
             }
         } else {
             None
         }
+    }
+
+    /// Consumes the sequencer, returning the actions it has not yet triggered.
+    ///
+    /// Used to hand the remaining work to a freshly reopened sequencer after a crash, dropping
+    /// the old reader and writer so the buffer lock is released.
+    pub fn into_remaining_actions(self) -> Vec<Action> {
+        self.actions
     }
 
     /// Gets the result of pending write action, if one is in-flight.
